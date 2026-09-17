@@ -346,8 +346,13 @@ class JiraClient:
                         continue
                     started = wl.get("started", "")
                     try:
-                        wl_dt = datetime.strptime(started[:19], "%Y-%m-%dT%H:%M:%S")
-                        wl_date = wl_dt.date()
+                        started_norm = started.replace("Z", "+00:00")
+                        if len(started_norm) >= 5 and started_norm[-5] in "+-" and started_norm[-3] != ":":
+                            started_norm = f"{started_norm[:-2]}:{started_norm[-2:]}"
+                        wl_dt = datetime.fromisoformat(started_norm)
+                        if wl_dt.tzinfo is None:
+                            wl_dt = self.tz.localize(wl_dt)
+                        wl_date = wl_dt.astimezone(self.tz).date()
                     except Exception:
                         continue
                     seconds = int(wl.get("timeSpentSeconds") or 0)
