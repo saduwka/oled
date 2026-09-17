@@ -1,15 +1,22 @@
+"""Physical SSD1306 OLED monitor.
+
+Currently unused — the phone web dashboard (web_monitor.py) replaced this
+screen and the `oled_monitor.service` unit is masked. Kept for the Telegram
+OLED menu and in case the hardware display is re-enabled; see README.
+
+Shares system-stats and oled_config plumbing with monitor_data.py via
+system_stats.py instead of duplicating it.
+"""
+from __future__ import annotations
+
 import math
 import os
 import random
-import sqlite3
-import subprocess
 import threading
 import time
 from datetime import datetime
 
-import psutil
 import pytz
-import requests
 from dotenv import load_dotenv
 from luma.core.interface.serial import i2c
 from luma.core.render import canvas
@@ -17,13 +24,12 @@ from luma.oled.device import ssd1306
 from PIL import ImageFont
 
 from jira_client import JiraClient
+from system_stats import OledConfigCache, get_ip, system_snapshot
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-OWM_API_KEY = os.getenv("OWM_API_KEY", "")
 CITY = os.getenv("CITY", "Astana")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Almaty")
-DB_PATH = os.getenv("DB_PATH", "/root/bot/bot.db")
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", 5))
 JIRA_REFRESH = int(os.getenv("JIRA_REFRESH", 300))
 WEATHER_REFRESH = int(os.getenv("WEATHER_REFRESH", 600))
@@ -43,31 +49,8 @@ except Exception:
     FONT_L = FONT_M = FONT_S = FONT_XL = ImageFont.load_default()
 
 
-class Utils:
-    @staticmethod
-    def get_ip():
-        try:
-            return subprocess.check_output(
-                "hostname -I | cut -d' ' -f1", shell=True
-            ).decode("utf-8").strip()
-        except Exception:
-            return "127.0.0.1"
-
-
-class Config:
-    @staticmethod
-    def get_oled_mode():
-        try:
-            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-            res = conn.execute("SELECT key, value FROM oled_config").fetchall()
-            conn.close()
-            return dict(res)
-        except Exception:
-            return {"power": "on", "forced_screen": "-1", "scrolling_text": ""}
-
-
 class OledMonitor:
-    def __init__(self):
+    def __init__(self) -> None:
         try:
             self.device = ssd1306(
                 i2c(
@@ -79,81 +62,84 @@ class OledMonitor:
             raise SystemExit(1)
         self.device.clear()
         self.tz = pytz.timezone(TIMEZONE)
-        self.weather = {
-            "main": "Wait",
-            "temp": "0",
-            "hum": "0",
-            "wind": "0",
-            "desc": "loading...",
-        }
-        self.last_weather_time = 0
-        self.cache = {
-            "ip": "127.0.0.1",
-            "conf": {"power": "on", "forced_screen": "-1", "scrolling_text": ""},
-            "cpu": 0,
-            "ram": 0,
-            "ram_used_mb": 0,
-            "ram_total_mb": 0,
-            "fan": 0,
-            "temp": 0.0,
-        }
-        self.jira = {
-            "todo": "--",
-            "in_progress": "--",
-            "week_h": "--",
-            "month_h": "--",
-            "ok": False,
-        }
-        self.last_jira_time = 0
+        self.weather = {"main": "Wait", "temp": "0", "hum": "0", "wind": "0", "desc": "loading..."}
+        self.last_weather_time = 0.0
+        self.cache = {"ip": "127.0.0.1"}
+        self.jira = {"todo": "--", "in_progress": "--", "week_h": "--", "month_h": "--", "ok": False}
+        self.last_jira_time = 0.0
         self.jira_client = JiraClient()
+
+        self._oled_config = OledConfigCache()
         self.scroll_x = 128
         self.is_scrolling = False
         self.scroll_text_active = ""
         self.saved_screen = None
         self._display_on = True
         self._last_frame_key = None
-        self._db_mtime = None
-        self._last_ip_time = 0
+        self._last_ip_time = 0.0
         self._lock = threading.Lock()
 
-    def get_cpu_temp(self):
-        try:
-            with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
-                return float(f.read()) / 1000.0
-        except Exception:
-            return 0.0
+    # -- data refresh --------------------------------------------------------
+    def update_jira_cache(self) -> None:
+        stats = self.jira_client.fetch_stats()
+        with self._lock:
+            self.jira = {
+                "todo": stats.get("todo", "--"),
+                "in_progress": stats.get("in_progress", "--"),
+                "week_h": stats.get("week_h", "--"),
+                "month_h": stats.get("month_h", "--"),
+                "ok": bool(stats.get("ok")),
+            }
+            self.last_jira_time = time.time()
 
-    def get_fan_speed(self):
-        try:
-            with open("/sys/class/thermal/cooling_device0/cur_state", "r") as f:
-                state = int(f.read().strip())
-            state_map = {0: 0, 1: 50, 2: 75, 3: 100, 4: 100}
-            return state_map.get(state, 0)
-        except Exception:
-            return 0
+    def update_weather_cache(self) -> None:
+        owm_key = os.getenv("OWM_API_KEY", "")
+        if not owm_key or owm_key == "YOUR_OPENWEATHERMAP_KEY":
+            self.last_weather_time = time.time()
+            return
+        import requests
 
-    def _load_oled_config(self):
         try:
-            mtime = os.path.getmtime(DB_PATH)
-        except OSError:
-            return self.cache.get("conf") or {"power": "on", "forced_screen": "-1", "scrolling_text": ""}
-        if self._db_mtime == mtime and self.cache.get("conf"):
-            return self.cache["conf"]
-        conf = Config.get_oled_mode()
-        self._db_mtime = mtime
-        return conf
-
-    def _clear_scrolling_text(self):
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute("UPDATE oled_config SET value='' WHERE key='scrolling_text'")
-            conn.commit()
-            conn.close()
+            r = requests.get(
+                "http://api.openweathermap.org/data/2.5/weather",
+                params={"q": CITY, "appid": owm_key, "units": "metric"},
+                timeout=3,
+            ).json()
+            if "weather" in r:
+                with self._lock:
+                    self.weather = {
+                        "main": r["weather"][0]["main"],
+                        "temp": f"{r['main']['temp']:.0f}",
+                        "hum": f"{r['main']['humidity']}",
+                        "wind": f"{r['wind']['speed']:.1f}",
+                        "desc": r["weather"][0]["description"],
+                    }
+                    self.last_weather_time = time.time()
         except Exception:
             pass
-        if "conf" in self.cache:
-            self.cache["conf"]["scrolling_text"] = ""
 
+    def update_data_cache(self) -> None:
+        now = time.time()
+        if now - self._last_ip_time >= IP_REFRESH or self.cache.get("ip") == "127.0.0.1":
+            self.cache["ip"] = get_ip()
+            self._last_ip_time = now
+        conf = self._oled_config.get()
+        self.cache["conf"] = conf
+        self.cache.update(system_snapshot(include_top_procs=False))
+
+    def _net_loop(self) -> None:
+        while True:
+            try:
+                now = time.time()
+                if now - self.last_weather_time >= WEATHER_REFRESH:
+                    self.update_weather_cache()
+                if now - self.last_jira_time >= JIRA_REFRESH:
+                    self.update_jira_cache()
+            except Exception:
+                pass
+            time.sleep(5)
+
+    # -- drawing helpers ------------------------------------------------
     def draw_cpu_icon(self, draw, x, y, usage):
         draw.rectangle((x, y, x + 14, y + 14), outline="white")
         for i in range(3):
@@ -246,7 +232,7 @@ class OledMonitor:
             self.is_scrolling = False
             self.scroll_text_active = ""
             self.saved_screen = None
-            self._clear_scrolling_text()
+            self._oled_config.clear_scrolling_text()
 
     def draw_scrolling_text(self, draw, text):
         draw.text((self.scroll_x, 12), text, font=FONT_XL, fill="white")
@@ -309,66 +295,6 @@ class OledMonitor:
         draw.text((0, 36), f"WEEK   {j['week_h']}", font=FONT_M, fill="white")
         draw.text((0, 50), f"MONTH  {j['month_h']}", font=FONT_M, fill="white")
 
-    def update_jira_cache(self):
-        stats = self.jira_client.fetch_stats()
-        with self._lock:
-            self.jira = {
-                "todo": stats.get("todo", "--"),
-                "in_progress": stats.get("in_progress", "--"),
-                "week_h": stats.get("week_h", "--"),
-                "month_h": stats.get("month_h", "--"),
-                "ok": bool(stats.get("ok")),
-            }
-            self.last_jira_time = time.time()
-
-    def update_weather_cache(self):
-        if not OWM_API_KEY or OWM_API_KEY == "YOUR_OPENWEATHERMAP_KEY":
-            self.last_weather_time = time.time()
-            return
-        try:
-            r = requests.get(
-                f"http://api.openweathermap.org/data/2.5/weather?q={CITY}&appid={OWM_API_KEY}&units=metric",
-                timeout=1,
-            ).json()
-            if "weather" in r:
-                with self._lock:
-                    self.weather = {
-                        "main": r["weather"][0]["main"],
-                        "temp": f"{r['main']['temp']:.0f}",
-                        "hum": f"{r['main']['humidity']}",
-                        "wind": f"{r['wind']['speed']:.1f}",
-                        "desc": r["weather"][0]["description"],
-                    }
-                    self.last_weather_time = time.time()
-        except Exception:
-            pass
-
-    def _net_loop(self):
-        while True:
-            try:
-                now = time.time()
-                if now - self.last_weather_time >= WEATHER_REFRESH:
-                    self.update_weather_cache()
-                if now - self.last_jira_time >= JIRA_REFRESH:
-                    self.update_jira_cache()
-            except Exception:
-                pass
-            time.sleep(5)
-
-    def update_data_cache(self):
-        now = time.time()
-        if now - self._last_ip_time >= IP_REFRESH or self.cache["ip"] == "127.0.0.1":
-            self.cache["ip"] = Utils.get_ip()
-            self._last_ip_time = now
-        self.cache["conf"] = self._load_oled_config()
-        self.cache["cpu"] = psutil.cpu_percent()
-        ram = psutil.virtual_memory()
-        self.cache["ram"] = ram.percent
-        self.cache["ram_used_mb"] = (ram.total - ram.available) // (1024 * 1024)
-        self.cache["ram_total_mb"] = ram.total // (1024 * 1024)
-        self.cache["fan"] = self.get_fan_speed()
-        self.cache["temp"] = self.get_cpu_temp()
-
     def _frame_key(self, screen_idx):
         dt = datetime.now(self.tz)
         c = self.cache
@@ -395,7 +321,7 @@ class OledMonitor:
         self.draw_welcome()
         threading.Thread(target=self._net_loop, name="oled-net", daemon=True).start()
         screens = [self.screen_system, self.screen_weather, self.screen_jira]
-        idx, last_data_update, last_screen_switch = 0, 0, time.time()
+        idx, last_data_update, last_screen_switch = 0, 0.0, time.time()
         while True:
             try:
                 now = time.time()
@@ -432,7 +358,7 @@ class OledMonitor:
                     self.scroll_text_active = scroll_txt
                     self.scroll_x = 128
                     self.saved_screen = current_idx
-                    self._clear_scrolling_text()
+                    self._oled_config.clear_scrolling_text()
                     self._last_frame_key = None
 
                 if self.is_scrolling:

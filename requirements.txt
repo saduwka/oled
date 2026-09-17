@@ -1,0 +1,8 @@
+psutil>=5.9
+requests>=2.31
+pytz>=2024.1
+python-dotenv>=1.0
+
+# Only needed if the physical SSD1306 OLED is enabled (see oled_monitor.py)
+luma.oled>=3.13; extra == "oled"
+Pillow>=10.0; extra == "oled"
