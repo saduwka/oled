@@ -429,8 +429,14 @@ class JiraClient:
             day_keys = self._search_keys(
                 f'worklogAuthor = currentUser() AND worklogDate >= "{day_str}"'
             )
+            # day_keys is a subset of issue_keys in practice (same JQL, wider
+            # date range), but dedupe explicitly so an issue's worklog is
+            # never summed twice - that previously double-counted every
+            # worklog on an issue touched today, roughly doubling day/week
+            # totals.
+            all_keys = list(dict.fromkeys(issue_keys + day_keys))
             week_seconds, month_seconds, day_seconds = self._sum_worklogs(
-                issue_keys + day_keys, account_id, week_start, month_start, day_start
+                all_keys, account_id, week_start, month_start, day_start
             )
 
             columns_out = columns if board_id else []
