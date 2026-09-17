@@ -1,3 +1,6 @@
+/* =========================================================================
+   Design tokens (colors, spacing, fonts)
+   ========================================================================= */
 :root {
   --gap: 8px;
   --pad: 8px;
@@ -24,6 +27,9 @@
   --sy: 0px;
 }
 
+/* =========================================================================
+   Base reset & page shell
+   ========================================================================= */
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body {
@@ -37,6 +43,9 @@ html, body {
   -webkit-tap-highlight-color: transparent;
 }
 
+/* =========================================================================
+   Grid layout: topbar / system+jira / music
+   ========================================================================= */
 .stage {
   width: 100vw;
   height: 100dvh;
@@ -53,6 +62,7 @@ html, body {
   transition: transform 0.2s linear;
 }
 
+/* -- topbar: brand pill, clock, weather ---------------------------------- */
 .topbar {
   grid-area: topbar;
   display: grid;
@@ -141,6 +151,7 @@ html, body {
   white-space: nowrap;
 }
 
+/* -- shared panel chrome (system / jira / music) ------------------------- */
 .panel {
   position: relative;
   background: var(--panel);
@@ -154,6 +165,7 @@ html, body {
   gap: 8px;
 }
 
+/* -- panel grid placement ------------------------------------------------- */
 .system { grid-area: system; }
 .music { grid-area: music; }
 .jira { grid-area: jira; }
@@ -175,6 +187,7 @@ html, body {
   min-height: 0;
 }
 
+/* -- music: cover art / ambient background ------------------------------- */
 .music-ambient {
   position: absolute;
   inset: -20%;
@@ -200,6 +213,7 @@ html, body {
   background: linear-gradient(90deg, rgba(10, 16, 18, 0.55), rgba(10, 16, 18, 0.82));
 }
 
+/* -- music: now-playing meta (title/artist/time) ------------------------- */
 .music-now {
   position: relative;
   z-index: 1;
@@ -289,6 +303,7 @@ html, body {
   transition: width 0.9s linear;
 }
 
+/* -- music: transport buttons (pause/next/stop/wave) --------------------- */
 .music-controls {
   display: flex;
   align-items: center;
@@ -394,6 +409,7 @@ html, body {
   pointer-events: none;
 }
 
+/* -- shared panel head + system CPU/RAM bars ------------------------------ */
 .panel-head {
   display: flex;
   justify-content: space-between;
@@ -486,6 +502,7 @@ html, body {
 .temp-warn .meta-value { color: var(--temp-warn); }
 .temp-hot .meta-value { color: var(--temp-hot); }
 
+/* -- jira: header, hour chips, todo/wip lists ----------------------------- */
 .jira-head {
   display: flex;
   justify-content: space-between;
@@ -627,6 +644,7 @@ html, body {
   padding: 8px 4px;
 }
 
+/* -- power-off overlay + scrolling text banner ---------------------------- */
 .power-off {
   position: fixed;
   inset: 0;
@@ -710,6 +728,7 @@ html, body {
 }
 
 
+/* -- music: error toast + volume dock ------------------------------------- */
 .music-error {
   position: absolute;
   left: 12px;
@@ -813,6 +832,9 @@ html, body {
 }
 
 
+/* =========================================================================
+   Fullscreen expand mode (tap a panel to zoom in)
+   ========================================================================= */
 /* --- fullscreen expand --- */
 .panel-close {
   display: none;
@@ -950,6 +972,9 @@ html, body {
 }
 
 
+/* =========================================================================
+   3D flip animation between compact and expanded panel faces
+   ========================================================================= */
 /* --- panel flip faces --- */
 .panel {
   perspective: 1400px;
@@ -1392,6 +1417,7 @@ html, body {
 }
 
 
+/* -- music: lyrics panel (expanded mode only) ------------------------------ */
 .music-lyrics {
   display: none;
 }

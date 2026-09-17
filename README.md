@@ -17,15 +17,26 @@
 ## Требования
 
 - **Python 3.7+**
-- **Библиотеки:** `psutil`, `requests`, `pytz`, `python-dotenv` (+ `yandex-music` для обложек/волны через gamebot).
+- **Библиотеки:** см. `requirements.txt` (`psutil`, `requests`, `pytz`, `python-dotenv`; опционально `luma.oled`/`Pillow` для физического экрана — extra `oled`).
 
 ## Установка
 
 ```bash
 cd /root/oled
-pip install psutil requests pytz python-dotenv
+pip install -r requirements.txt
+# для физического OLED-экрана дополнительно:
+# pip install -r requirements.txt luma.oled Pillow
 cp .env.example .env   # заполните ключи
 ```
+
+## Архитектура
+
+- `system_stats.py` — общий модуль метрик (CPU/RAM/диск/fan, конфиг `oled_config`), используется и веб-дашбордом (`monitor_data.py`), и физическим экраном (`oled_monitor.py`), чтобы не дублировать логику.
+- `monitor_data.py` — кэш снапшота для веб-API (`/api/status`).
+- `jira_client.py` — клиент Jira Cloud (спринт, worklog).
+- `music_bridge.py` — мост к внешнему плееру Яндекс.Музыки (`/root/music`).
+- `web_monitor.py` — HTTP-сервер (stdlib `http.server`) и SSE для live-обновлений музыки.
+- `oled_monitor.py` — рендер на физический SSD1306 (сейчас выключен, юнит замаскирован).
 
 ## Настройка .env
 

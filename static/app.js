@@ -1,4 +1,7 @@
 (() => {
+  // =========================================================================
+  // DOM element cache + module-wide state
+  // =========================================================================
   const $ = (id) => document.getElementById(id);
 
   const els = {
@@ -64,6 +67,7 @@
     keepAwakeVideo: $("keepAwakeVideo"),
   };
 
+  // -- timing constants ------------------------------------------------------
   const POLL_MS = 1000;
   const CLOCK_MS = 15000;
   const SHIFT_MS = 60000;
@@ -71,6 +75,7 @@
   const WAKE_REFRESH_MS = 60000;
   const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
+  // -- poll / clock / anti-burn-in state --------------------------------------
   let lastScroll = "";
   let scrollAckTimer = null;
   let pollTimer = null;
@@ -84,6 +89,7 @@
   let lastCpu = null;
   let lastRam = null;
   let lastCoverUrl = "";
+  // -- music player state -----------------------------------------------------
   let musicBusy = false;
   let musicNextLoading = false;
   let musicNextSafetyTimer = null;
@@ -101,6 +107,7 @@
   let lastVolume = 70;
 
 
+  // -- expand/collapse (fullscreen panel) + jira/lyrics scroll state -----------
   let expandMode = null;
   let lastStatus = null;
   let lastJiraBoardSig = "";
@@ -114,11 +121,13 @@
   let lyricsScrollRaf = 0;
 
 
+  // -- clock/timezone state -----------------------------------------------------
   let clockState = {
     timezone: "Asia/Almaty",
     city: "",
   };
 
+  // -- anti-burn-in pixel-shift orbit points ------------------------------------
   const ORBIT = (() => {
     const pts = [];
     for (let i = 0; i < 12; i++) {
@@ -131,6 +140,9 @@
     return pts;
   })();
 
+  // =========================================================================
+  // Clock, weather, anti-burn-in pixel shift
+  // =========================================================================
   function applyPixelShift() {
     const p = ORBIT[orbitIdx % ORBIT.length];
     els.stage.style.setProperty("--sx", `${p.x}px`);
@@ -200,6 +212,9 @@
     }
   }
 
+  // =========================================================================
+  // Wake lock / keep-awake handling
+  // =========================================================================
   function stopVideoFallback() {
     if (!els.keepAwakeVideo) return;
     try {
@@ -241,6 +256,9 @@
   }
 
 
+  // =========================================================================
+  // Music: volume, progress tick, error toast
+  // =========================================================================
   function setVolumeUI(vol) {
     const v = Math.max(0, Math.min(100, Math.round(Number(vol) || 0)));
     lastVolume = v;
@@ -318,6 +336,9 @@
 
 
 
+  // =========================================================================
+  // Music: lyrics sync-scroll
+  // =========================================================================
   function clearLyricsUI(message) {
     cancelLyricsScroll();
     lyricsTrackId = "";
@@ -472,6 +493,9 @@
     }
   }
 
+  // =========================================================================
+  // Fullscreen expand/collapse for system/jira/music panels
+  // =========================================================================
   function fmtUptime(sec) {
     const s = Math.max(0, Math.floor(Number(sec) || 0));
     const d = Math.floor(s / 86400);
@@ -591,6 +615,9 @@
     expandAnimTimer = setTimeout(finish, 380);
   }
 
+  // =========================================================================
+  // System detail panel (expanded view: top processes, meta chips)
+  // =========================================================================
   function renderSystemDetail(s) {
     if (!els.systemDetailGrid) return;
     const chips = [
@@ -624,6 +651,9 @@
   }
 
 
+  // =========================================================================
+  // Jira board rendering (compact + expanded views)
+  // =========================================================================
   function captureJiraExpandScroll() {
     const board = els.jiraBoardFull;
     if (!board) return null;
@@ -689,6 +719,9 @@
     });
   }
 
+  // =========================================================================
+  // Music panel rendering (now playing, controls, device)
+  // =========================================================================
   function setBtDeviceUI(name) {
     if (!els.musicDevice) return;
     const label = String(name || "").trim();
@@ -933,6 +966,9 @@
     });
   }
 
+  // =========================================================================
+  // Top-level render: applies a /api/status snapshot to the whole page
+  // =========================================================================
   function render(data, opts = {}) {
     lastStatus = data;
     const powerOn = (data.power || "on") !== "off";
@@ -1035,6 +1071,9 @@
     }
   }
 
+  // =========================================================================
+  // Polling loop, SSE live updates, visibility-driven resume
+  // =========================================================================
   function schedulePoll(delay) {
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = setTimeout(async () => {
@@ -1090,6 +1129,9 @@
     scheduleWakeRefresh();
   }
 
+  // =========================================================================
+  // Event wiring: visibility/lifecycle, pointer gestures, buttons, init
+  // =========================================================================
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") resumeLive();
   });
