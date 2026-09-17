@@ -1,0 +1,594 @@
+(() => {
+  const $ = (id) => document.getElementById(id);
+
+  const els = {
+    stage: $("stage"),
+    powerOff: $("power-off"),
+    scrollBanner: $("scroll-banner"),
+    scrollText: $("scroll-text"),
+    city: $("city"),
+    cond: $("cond"),
+    clockTime: $("clockTime"),
+    temp: $("temp"),
+    humidity: $("humidity"),
+    wind: $("wind"),
+    cpuVal: $("cpuVal"),
+    cpuBar: $("cpuBar"),
+    ramVal: $("ramVal"),
+    ramBar: $("ramBar"),
+    fanVal: $("fanVal"),
+    tempVal: $("tempVal"),
+    tempItem: $("tempItem"),
+    ipVal: $("ipVal"),
+    jiraTitle: $("jiraTitle"),
+    sprintName: $("sprintName"),
+    jiraTodo: $("jiraTodo"),
+    jiraWip: $("jiraWip"),
+    jiraWeek: $("jiraWeek"),
+    jiraMonth: $("jiraMonth"),
+    todoLabel: $("todoLabel"),
+    wipLabel: $("wipLabel"),
+    todoList: $("todoList"),
+    wipList: $("wipList"),
+    blockMusic: $("block-music"),
+    musicError: $("musicError"),
+    musicAmbient: $("musicAmbient"),
+    musicCover: $("musicCover"),
+    musicTitle: $("musicTitle"),
+    musicArtist: $("musicArtist"),
+    musicProgress: $("musicProgress"),
+    musicTrackFill: $("musicTrackFill"),
+    musicVolume: $("musicVolume"),
+    musicVolumeVal: $("musicVolumeVal"),
+    btnPause: $("btnPause"),
+    iconPause: $("iconPause"),
+    iconPlay: $("iconPlay"),
+    keepAwakeVideo: $("keepAwakeVideo"),
+  };
+
+  const POLL_MS = 1000;
+  const CLOCK_MS = 15000;
+  const SHIFT_MS = 60000;
+  const SHIFT_PX = 6;
+  const WAKE_REFRESH_MS = 60000;
+  const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+  let lastScroll = "";
+  let scrollAckTimer = null;
+  let pollTimer = null;
+  let clockTimer = null;
+  let shiftTimer = null;
+  let wakeRefreshTimer = null;
+  let wakeLock = null;
+  let videoFallbackOn = false;
+  let polling = false;
+  let orbitIdx = 0;
+  let lastCpu = null;
+  let lastRam = null;
+  let lastCoverUrl = "";
+  let musicBusy = false;
+  let musicEpoch = 0;
+  let musicTrackId = "";
+  let musicPos = 0;
+  let musicDur = 0;
+  let musicPlaying = false;
+  let musicPaused = false;
+  let musicTickTimer = null;
+  let musicErrorTimer = null;
+  let musicLastTickAt = 0;
+  let volumeDragging = false;
+  let volumeDebounce = null;
+  let lastVolume = 70;
+
+  let clockState = {
+    timezone: "Asia/Almaty",
+    city: "",
+  };
+
+  const ORBIT = (() => {
+    const pts = [];
+    for (let i = 0; i < 12; i++) {
+      const a = (i / 12) * Math.PI * 2;
+      pts.push({
+        x: Math.round(Math.cos(a) * SHIFT_PX),
+        y: Math.round(Math.sin(a) * SHIFT_PX),
+      });
+    }
+    return pts;
+  })();
+
+  function applyPixelShift() {
+    const p = ORBIT[orbitIdx % ORBIT.length];
+    els.stage.style.setProperty("--sx", `${p.x}px`);
+    els.stage.style.setProperty("--sy", `${p.y}px`);
+    orbitIdx = (orbitIdx + 1) % ORBIT.length;
+  }
+
+  function formatInTz(date, timezone) {
+    try {
+      const fmt = new Intl.DateTimeFormat("en-GB", {
+        timeZone: timezone,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        day: "2-digit",
+        month: "2-digit",
+        weekday: "short",
+        hour12: false,
+      });
+      const parts = Object.fromEntries(fmt.formatToParts(date).map((p) => [p.type, p.value]));
+      return {
+        time: `${parts.hour}:${parts.minute}:${parts.second}`,
+        date: `${parts.day}.${parts.month}`,
+        weekday: parts.weekday || DAYS[date.getDay()],
+      };
+    } catch (_) {
+      const pad = (n) => String(n).padStart(2, "0");
+      return {
+        time: `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`,
+        date: `${pad(date.getDate())}.${pad(date.getMonth() + 1)}`,
+        weekday: DAYS[date.getDay()],
+      };
+    }
+  }
+
+  function paintClock() {
+    const wall = formatInTz(new Date(), clockState.timezone);
+    els.clockTime.textContent = wall.time.slice(0, 5);
+    if (clockState.city) {
+      els.city.textContent = `${wall.weekday} ${wall.date} · ${clockState.city}`;
+    }
+  }
+
+  function setTempClass(celsius) {
+    els.tempItem.classList.remove("temp-ok", "temp-warn", "temp-hot");
+    if (celsius >= 70) els.tempItem.classList.add("temp-hot");
+    else if (celsius >= 55) els.tempItem.classList.add("temp-warn");
+    else els.tempItem.classList.add("temp-ok");
+  }
+
+  function fmtTime(sec) {
+    const s = Math.max(0, Math.floor(Number(sec) || 0));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}:${String(r).padStart(2, "0")}`;
+  }
+
+  async function startVideoFallback() {
+    if (!els.keepAwakeVideo || videoFallbackOn) return;
+    try {
+      els.keepAwakeVideo.muted = true;
+      els.keepAwakeVideo.playsInline = true;
+      await els.keepAwakeVideo.play();
+      videoFallbackOn = true;
+    } catch (_) {
+      videoFallbackOn = false;
+    }
+  }
+
+  function stopVideoFallback() {
+    if (!els.keepAwakeVideo) return;
+    try {
+      els.keepAwakeVideo.pause();
+    } catch (_) {}
+    videoFallbackOn = false;
+  }
+
+  async function requestWakeLock() {
+    if (document.visibilityState !== "visible") return;
+    if (!navigator.wakeLock) {
+      await startVideoFallback();
+      return;
+    }
+    try {
+      if (wakeLock && !wakeLock.released) return;
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => {
+        wakeLock = null;
+        if (document.visibilityState === "visible") {
+          requestWakeLock();
+        }
+      });
+      stopVideoFallback();
+    } catch (_) {
+      await startVideoFallback();
+    }
+  }
+
+  function scheduleWakeRefresh() {
+    if (wakeRefreshTimer) clearInterval(wakeRefreshTimer);
+    wakeRefreshTimer = setInterval(() => {
+      if (document.visibilityState === "visible") requestWakeLock();
+    }, WAKE_REFRESH_MS);
+  }
+
+  function enableKeepAwakeFromGesture() {
+    requestWakeLock();
+  }
+
+
+  function setVolumeUI(vol) {
+    const v = Math.max(0, Math.min(100, Math.round(Number(vol) || 0)));
+    lastVolume = v;
+    if (els.musicVolume && !volumeDragging) els.musicVolume.value = String(v);
+    if (els.musicVolumeVal) els.musicVolumeVal.textContent = String(v);
+  }
+
+  function pushVolume(vol) {
+    const v = Math.max(0, Math.min(100, Math.round(Number(vol) || 0)));
+    lastVolume = v;
+    if (els.musicVolumeVal) els.musicVolumeVal.textContent = String(v);
+    if (volumeDebounce) clearTimeout(volumeDebounce);
+    volumeDebounce = setTimeout(async () => {
+      try {
+        const res = await fetch("/api/music", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "volume", value: v }),
+          cache: "no-store",
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.ok === false) {
+          showMusicError(data.error || "Volume failed");
+          return;
+        }
+        if (data.music && data.music.volume != null && !volumeDragging) {
+          setVolumeUI(data.music.volume);
+        }
+      } catch (_) {
+        showMusicError("Volume network error");
+      }
+    }, 120);
+  }
+
+  function showMusicError(msg) {
+    if (!els.musicError) return;
+    els.musicError.textContent = msg || "Music error";
+    els.musicError.classList.remove("hidden");
+    if (musicErrorTimer) clearTimeout(musicErrorTimer);
+    musicErrorTimer = setTimeout(() => {
+      els.musicError.classList.add("hidden");
+    }, 2800);
+  }
+
+  function paintMusicProgress() {
+    els.musicProgress.textContent = `${fmtTime(musicPos)} / ${fmtTime(musicDur)}`;
+    const pct = musicDur > 0 ? Math.min(100, (musicPos / musicDur) * 100) : 0;
+    els.musicTrackFill.style.width = `${pct}%`;
+  }
+
+  function stopMusicTick() {
+    if (musicTickTimer) {
+      clearInterval(musicTickTimer);
+      musicTickTimer = null;
+    }
+  }
+
+  function startMusicTick() {
+    stopMusicTick();
+    musicLastTickAt = Date.now();
+    musicTickTimer = setInterval(() => {
+      if (!musicPlaying || musicPaused || musicBusy) {
+        musicLastTickAt = Date.now();
+        return;
+      }
+      const now = Date.now();
+      const dt = (now - musicLastTickAt) / 1000;
+      musicLastTickAt = now;
+      musicPos = Math.min(musicDur || musicPos + dt, musicPos + dt);
+      if (musicDur > 0) musicPos = Math.min(musicPos, musicDur);
+      paintMusicProgress();
+    }, 500);
+  }
+
+  function renderMusic(m) {
+    const music = m || {};
+    const playing = !!music.playing;
+    const paused = !!music.paused;
+    const trackId = String(music.track_id || "");
+    const trackChanged = trackId && trackId !== musicTrackId;
+
+    els.blockMusic.classList.toggle("idle", !playing);
+    musicPlaying = playing;
+    musicPaused = paused;
+    musicTrackId = trackId;
+    musicDur = Number(music.duration) || 0;
+    musicPos = Number(music.time_pos) || 0;
+
+    if (!playing) {
+      els.musicTitle.textContent = "Nothing playing";
+      els.musicArtist.textContent = "Yandex Music";
+      musicPos = 0;
+      musicDur = 0;
+      paintMusicProgress();
+      if (music.volume != null) setVolumeUI(music.volume);
+      els.musicAmbient.style.backgroundImage = "";
+      lastCoverUrl = "";
+      els.musicCover.removeAttribute("src");
+      els.musicCover.hidden = true;
+      stopMusicTick();
+      return;
+    }
+
+    els.musicTitle.textContent = music.title || "—";
+    els.musicArtist.textContent = music.artists || "—";
+    paintMusicProgress();
+    if (music.volume != null) setVolumeUI(music.volume);
+
+    els.iconPause.classList.toggle("hidden", paused);
+    els.iconPlay.classList.toggle("hidden", !paused);
+
+    const cover = music.cover_url || "";
+    if (trackChanged) {
+      // Drop stale artwork immediately so previous cover never sticks
+      lastCoverUrl = "";
+      els.musicCover.removeAttribute("src");
+      els.musicAmbient.style.backgroundImage = "";
+      els.musicCover.hidden = true;
+    }
+    if (cover && cover !== lastCoverUrl) {
+      els.musicCover.src = cover;
+      els.musicCover.hidden = false;
+      els.musicAmbient.style.backgroundImage = `url("${cover}")`;
+      lastCoverUrl = cover;
+    } else if (!cover) {
+      els.musicCover.removeAttribute("src");
+      els.musicCover.hidden = true;
+      els.musicAmbient.style.backgroundImage = "";
+      lastCoverUrl = "";
+    }
+
+    if (playing && !paused) startMusicTick();
+    else stopMusicTick();
+  }
+
+  function setMusicBusy(busy, sourceBtn) {
+    musicBusy = busy;
+    els.blockMusic.classList.toggle("is-busy", busy);
+    document.querySelectorAll("[data-action]").forEach((btn) => {
+      btn.disabled = busy;
+      btn.classList.toggle("is-loading", busy && btn === sourceBtn);
+    });
+  }
+
+  async function musicAction(action, sourceBtn) {
+    if (musicBusy || !action) return;
+    musicEpoch += 1;
+    const prevPaused = musicPaused;
+    if (action === "pause" && musicPlaying) {
+      // Optimistic pause/play icon flip
+      musicPaused = !musicPaused;
+      els.iconPause.classList.toggle("hidden", musicPaused);
+      els.iconPlay.classList.toggle("hidden", !musicPaused);
+      if (musicPaused) stopMusicTick();
+      else startMusicTick();
+    }
+    setMusicBusy(true, sourceBtn || null);
+    enableKeepAwakeFromGesture();
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = setTimeout(() => ctrl && ctrl.abort(), 20000);
+    try {
+      const res = await fetch("/api/music", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+        cache: "no-store",
+        signal: ctrl ? ctrl.signal : undefined,
+      });
+      const data = await res.json().catch(() => ({}));
+      musicEpoch += 1;
+      if (!res.ok || data.ok === false) {
+        if (action === "pause") {
+          musicPaused = prevPaused;
+          els.iconPause.classList.toggle("hidden", musicPaused);
+          els.iconPlay.classList.toggle("hidden", !musicPaused);
+        }
+        showMusicError(data.error || "Music request failed");
+        if (data.music) renderMusic(data.music);
+        return;
+      }
+      if (data.music) renderMusic(data.music);
+      else await fetchStatus();
+    } catch (err) {
+      if (action === "pause") {
+        musicPaused = prevPaused;
+        els.iconPause.classList.toggle("hidden", musicPaused);
+        els.iconPlay.classList.toggle("hidden", !musicPaused);
+      }
+      const aborted = err && err.name === "AbortError";
+      showMusicError(aborted ? "Music timeout" : "Network error");
+    } finally {
+      clearTimeout(timer);
+      setMusicBusy(false, null);
+    }
+  }
+
+  function renderIssueList(ul, issues) {
+    ul.innerHTML = "";
+    const list = Array.isArray(issues) ? issues : [];
+    if (!list.length) {
+      const li = document.createElement("li");
+      li.className = "issue-empty";
+      li.textContent = "no issues";
+      ul.appendChild(li);
+      return;
+    }
+    list.forEach((issue) => {
+      const li = document.createElement("li");
+      li.className = "issue-item";
+      const key = document.createElement("span");
+      key.className = "issue-key";
+      key.textContent = issue.key || "—";
+      const summary = document.createElement("span");
+      summary.className = "issue-summary";
+      summary.textContent = issue.summary || "—";
+      summary.title = issue.summary || "";
+      li.appendChild(key);
+      li.appendChild(summary);
+      ul.appendChild(li);
+    });
+  }
+
+  function render(data, opts = {}) {
+    const powerOn = (data.power || "on") !== "off";
+    els.powerOff.classList.toggle("hidden", powerOn);
+    els.powerOff.setAttribute("aria-hidden", powerOn ? "true" : "false");
+
+    const scroll = (data.scrolling_text || "").trim();
+    if (scroll) {
+      els.scrollBanner.classList.remove("hidden");
+      if (scroll !== lastScroll) {
+        els.scrollText.textContent = scroll;
+        lastScroll = scroll;
+        if (scrollAckTimer) clearTimeout(scrollAckTimer);
+        scrollAckTimer = setTimeout(() => {
+          fetch("/api/scroll/ack", { cache: "no-store" }).catch(() => {});
+        }, 14000);
+      }
+    } else {
+      els.scrollBanner.classList.add("hidden");
+      lastScroll = "";
+    }
+
+    clockState.timezone = data.timezone || clockState.timezone || "Asia/Almaty";
+    clockState.city = data.city || clockState.city || "";
+    paintClock();
+
+    const w = data.weather || {};
+    els.cond.textContent = w.desc || w.main || "—";
+    els.temp.textContent = `${w.temp ?? "—"}°`;
+    els.humidity.textContent = `Hum ${w.hum ?? "—"}%`;
+    els.wind.textContent = `${w.wind ?? "—"} m/s`;
+
+    const s = data.system || {};
+    const cpu = Number(s.cpu) || 0;
+    const ram = Number(s.ram) || 0;
+    const sysTemp = Number(s.temp) || 0;
+    els.cpuVal.textContent = `${cpu}%`;
+    if (cpu !== lastCpu) {
+      els.cpuBar.style.width = `${Math.min(100, cpu)}%`;
+      lastCpu = cpu;
+    }
+    els.ramVal.textContent = `${s.ram_used_mb ?? 0}/${s.ram_total_mb ?? 0} · ${ram}%`;
+    if (ram !== lastRam) {
+      els.ramBar.style.width = `${Math.min(100, ram)}%`;
+      lastRam = ram;
+    }
+    els.fanVal.textContent = `${s.fan ?? 0}%`;
+    els.tempVal.textContent = `${sysTemp}°C`;
+    setTempClass(sysTemp);
+    els.ipVal.textContent = s.ip || "—";
+
+    const j = data.jira || {};
+    els.jiraTitle.textContent = j.ok ? "Eng" : "Eng Err";
+    els.jiraTitle.classList.toggle("err", !j.ok);
+    els.sprintName.textContent = j.sprint_name || "";
+    els.todoLabel.textContent = "To Do";
+    els.wipLabel.textContent = "In Progress";
+    els.jiraTodo.textContent = j.todo ?? "—";
+    els.jiraWip.textContent = j.in_progress ?? "—";
+    els.jiraWeek.textContent = j.week_h ?? "—";
+    els.jiraMonth.textContent = j.month_h ?? "—";
+    renderIssueList(els.todoList, j.todo_issues);
+    renderIssueList(els.wipList, j.wip_issues);
+    if (!opts.skipMusic) renderMusic(data.music);
+  }
+
+  async function fetchStatus() {
+    if (polling) return;
+    polling = true;
+    const epoch = musicEpoch;
+    try {
+      const res = await fetch("/api/status", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (epoch !== musicEpoch) return;
+      render(data, { skipMusic: musicBusy });
+    } catch (_) {
+      /* keep last frame */
+    } finally {
+      polling = false;
+    }
+  }
+
+  function schedulePoll(delay) {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(async () => {
+      await fetchStatus();
+      schedulePoll(POLL_MS);
+    }, delay);
+  }
+
+  function scheduleClock() {
+    if (clockTimer) clearTimeout(clockTimer);
+    const delay = Math.max(50, 1000 - (Date.now() % 1000));
+    clockTimer = setTimeout(function tick() {
+      paintClock();
+      clockTimer = setTimeout(tick, CLOCK_MS);
+    }, delay);
+  }
+
+  function scheduleShift() {
+    if (shiftTimer) clearTimeout(shiftTimer);
+    shiftTimer = setTimeout(() => {
+      applyPixelShift();
+      scheduleShift();
+    }, SHIFT_MS);
+  }
+
+  function resumeLive() {
+    fetchStatus();
+    schedulePoll(POLL_MS);
+    scheduleClock();
+    requestWakeLock();
+    scheduleWakeRefresh();
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") resumeLive();
+  });
+  window.addEventListener("pageshow", resumeLive);
+  window.addEventListener("online", resumeLive);
+  window.addEventListener("focus", resumeLive);
+
+  document.addEventListener(
+    "pointerdown",
+    () => {
+      enableKeepAwakeFromGesture();
+    },
+    { once: false, passive: true }
+  );
+
+  if (els.musicVolume) {
+    els.musicVolume.addEventListener("pointerdown", () => { volumeDragging = true; });
+    const endDrag = () => { volumeDragging = false; };
+    els.musicVolume.addEventListener("pointerup", endDrag);
+    els.musicVolume.addEventListener("pointercancel", endDrag);
+    els.musicVolume.addEventListener("change", endDrag);
+    els.musicVolume.addEventListener("input", () => {
+      pushVolume(els.musicVolume.value);
+    });
+  }
+
+  const brand = $("brandReload") || document.querySelector(".brand-pill");
+  if (brand) {
+    const hardReload = () => {
+      location.replace(location.pathname + "?r=" + Date.now());
+    };
+    brand.addEventListener("click", hardReload);
+    brand.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        hardReload();
+      }
+    });
+  }
+
+  document.querySelectorAll("[data-action]").forEach((btn) => {
+    btn.addEventListener("click", () => musicAction(btn.getAttribute("data-action"), btn));
+  });
+
+  applyPixelShift();
+  scheduleShift();
+  resumeLive();
+})();

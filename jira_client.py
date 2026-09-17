@@ -1,0 +1,458 @@
+"""Shared Jira Cloud stats for OLED and Telegram bot."""
+from __future__ import annotations
+
+import os
+from datetime import datetime, timedelta
+from typing import Any
+
+import pytz
+import requests
+from dotenv import dotenv_values, load_dotenv
+
+OLED_ENV_PATH = os.getenv("OLED_ENV_PATH", "/root/oled/.env")
+
+
+def load_jira_env(env_path: str | None = None) -> dict[str, str]:
+    path = env_path or OLED_ENV_PATH
+    file_vals = dotenv_values(path)
+    # Ensure process env also sees OLED values for any other readers.
+    load_dotenv(path, override=False)
+    return {
+        "base_url": (file_vals.get("JIRA_BASE_URL") or os.getenv("JIRA_BASE_URL", "")).rstrip("/"),
+        "email": file_vals.get("JIRA_EMAIL") or os.getenv("JIRA_EMAIL", ""),
+        "api_token": file_vals.get("JIRA_API_TOKEN") or os.getenv("JIRA_API_TOKEN", ""),
+        "timezone": file_vals.get("TIMEZONE") or os.getenv("TIMEZONE", "Asia/Almaty"),
+        "todo_status": file_vals.get("JIRA_TODO_STATUS") or os.getenv("JIRA_TODO_STATUS", "To Do"),
+        "inprogress_status": file_vals.get("JIRA_INPROGRESS_STATUS")
+        or os.getenv("JIRA_INPROGRESS_STATUS", "In Progress"),
+        "board_id": (file_vals.get("JIRA_BOARD_ID") or os.getenv("JIRA_BOARD_ID", "")).strip(),
+        "todo_column": file_vals.get("JIRA_TODO_COLUMN") or os.getenv("JIRA_TODO_COLUMN", "To Do"),
+        "wip_column": file_vals.get("JIRA_WIP_COLUMN") or os.getenv("JIRA_WIP_COLUMN", "В работе"),
+    }
+
+
+def format_hours(seconds: int | float) -> str:
+    total = max(0, int(round(seconds)))
+    hours, rem = divmod(total, 3600)
+    minutes = rem // 60
+    if hours and minutes:
+        return f"{hours}H {minutes}M"
+    if hours:
+        return f"{hours}H"
+    return f"{minutes}M"
+
+
+def _escape_status(status: str) -> str:
+    return status.replace("\\", "\\\\").replace('"', '\\"')
+
+
+class JiraClient:
+    def __init__(self, cfg: dict[str, str] | None = None):
+        self.cfg = cfg or load_jira_env()
+        self.base_url = self.cfg["base_url"]
+        self.auth = (self.cfg["email"], self.cfg["api_token"])
+        self.headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        self.tz = pytz.timezone(self.cfg["timezone"])
+
+    def configured(self) -> bool:
+        return bool(self.base_url and self.cfg["email"] and self.cfg["api_token"])
+
+    def _count(self, jql: str) -> int:
+        r = requests.post(
+            f"{self.base_url}/rest/api/3/search/approximate-count",
+            auth=self.auth,
+            headers=self.headers,
+            json={"jql": jql},
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return int(data.get("count", data.get("total", 0)))
+
+    def _search_keys(self, jql: str, max_pages: int = 10) -> list[str]:
+        keys: list[str] = []
+        next_page_token = None
+        for _ in range(max_pages):
+            payload: dict[str, Any] = {
+                "jql": jql,
+                "maxResults": 100,
+                "fields": ["key"],
+            }
+            if next_page_token:
+                payload["nextPageToken"] = next_page_token
+            r = requests.post(
+                f"{self.base_url}/rest/api/3/search/jql",
+                auth=self.auth,
+                headers=self.headers,
+                json=payload,
+                timeout=12,
+            )
+            r.raise_for_status()
+            data = r.json()
+            for issue in data.get("issues", []):
+                key = issue.get("key")
+                if key:
+                    keys.append(key)
+            next_page_token = data.get("nextPageToken")
+            if not next_page_token:
+                break
+        return keys
+
+    def _myself_account_id(self) -> str:
+        r = requests.get(
+            f"{self.base_url}/rest/api/3/myself",
+            auth=self.auth,
+            headers=self.headers,
+            timeout=8,
+        )
+        r.raise_for_status()
+        return r.json().get("accountId")
+
+    def _board_column_status_ids(self, board_id: str, column_name: str) -> set[str]:
+        r = requests.get(
+            f"{self.base_url}/rest/agile/1.0/board/{board_id}/configuration",
+            auth=self.auth,
+            headers=self.headers,
+            timeout=10,
+        )
+        r.raise_for_status()
+        columns = r.json().get("columnConfig", {}).get("columns", [])
+        wanted = column_name.strip().casefold()
+        for col in columns:
+            if (col.get("name") or "").strip().casefold() == wanted:
+                return {
+                    str(s["id"])
+                    for s in col.get("statuses", [])
+                    if s.get("id") is not None
+                }
+        raise ValueError(f"column not found on board {board_id}: {column_name!r}")
+
+    def _board_active_sprints(self, board_id: str) -> list[dict[str, Any]]:
+        """Active sprints: [{id, name}, ...]."""
+        sprints: list[dict[str, Any]] = []
+        start_at = 0
+        while True:
+            r = requests.get(
+                f"{self.base_url}/rest/agile/1.0/board/{board_id}/sprint",
+                auth=self.auth,
+                headers=self.headers,
+                params={"state": "active", "startAt": start_at, "maxResults": 50},
+                timeout=10,
+            )
+            r.raise_for_status()
+            data = r.json()
+            for sprint in data.get("values", []):
+                sid = sprint.get("id")
+                if sid is not None:
+                    sprints.append(
+                        {
+                            "id": int(sid),
+                            "name": (sprint.get("name") or f"Sprint {sid}").strip(),
+                        }
+                    )
+            if data.get("isLast", True):
+                break
+            start_at += len(data.get("values", []))
+            if not data.get("values"):
+                break
+        return sprints
+
+    def _board_active_sprint_issues(
+        self, board_id: str, sprints: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        """Issues assigned to current user in all active board sprints."""
+        if sprints is None:
+            sprints = self._board_active_sprints(board_id)
+        issues: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for sprint in sprints:
+            sprint_id = sprint["id"]
+            start_at = 0
+            while True:
+                r = requests.get(
+                    f"{self.base_url}/rest/agile/1.0/board/{board_id}/sprint/{sprint_id}/issue",
+                    auth=self.auth,
+                    headers=self.headers,
+                    params={
+                        "jql": "assignee = currentUser()",
+                        "startAt": start_at,
+                        "maxResults": 50,
+                        "fields": "status,key,summary",
+                    },
+                    timeout=15,
+                )
+                r.raise_for_status()
+                data = r.json()
+                batch = data.get("issues", [])
+                for issue in batch:
+                    key = issue.get("key")
+                    if key and key not in seen_keys:
+                        seen_keys.add(key)
+                        issues.append(issue)
+                start_at += len(batch)
+                if start_at >= int(data.get("total", 0)) or not batch:
+                    break
+        return issues
+
+    def _issue_brief(self, issue: dict[str, Any]) -> dict[str, str]:
+        fields = issue.get("fields") or {}
+        return {
+            "key": issue.get("key") or "",
+            "summary": (fields.get("summary") or "").strip() or "—",
+        }
+
+    def _search_issue_briefs(self, jql: str, limit: int = 8) -> list[dict[str, str]]:
+        briefs: list[dict[str, str]] = []
+        next_page_token = None
+        while len(briefs) < limit:
+            payload: dict[str, Any] = {
+                "jql": jql,
+                "maxResults": min(50, limit - len(briefs)),
+                "fields": ["key", "summary"],
+            }
+            if next_page_token:
+                payload["nextPageToken"] = next_page_token
+            r = requests.post(
+                f"{self.base_url}/rest/api/3/search/jql",
+                auth=self.auth,
+                headers=self.headers,
+                json=payload,
+                timeout=12,
+            )
+            r.raise_for_status()
+            data = r.json()
+            batch = data.get("issues", [])
+            for issue in batch:
+                briefs.append(self._issue_brief(issue))
+                if len(briefs) >= limit:
+                    break
+            next_page_token = data.get("nextPageToken")
+            if not next_page_token or not batch:
+                break
+        return briefs
+
+    def _board_columns_config(self, board_id: str) -> list[dict[str, Any]]:
+        r = requests.get(
+            f"{self.base_url}/rest/agile/1.0/board/{board_id}/configuration",
+            auth=self.auth,
+            headers=self.headers,
+            timeout=10,
+        )
+        r.raise_for_status()
+        raw = r.json().get("columnConfig", {}).get("columns", []) or []
+        columns: list[dict[str, Any]] = []
+        for col in raw:
+            name = (col.get("name") or "").strip() or "—"
+            status_ids = {
+                str(s["id"])
+                for s in (col.get("statuses") or [])
+                if s.get("id") is not None
+            }
+            columns.append({"name": name, "status_ids": status_ids, "issues": []})
+        return columns
+
+    def _board_dashboard(self, board_id: str) -> dict[str, Any]:
+        todo_col = self.cfg["todo_column"]
+        wip_col = self.cfg["wip_column"]
+        columns_cfg = self._board_columns_config(board_id)
+        todo_ids: set[str] = set()
+        wip_ids: set[str] = set()
+        for col in columns_cfg:
+            name_cf = col["name"].casefold()
+            if name_cf == todo_col.strip().casefold():
+                todo_ids = set(col["status_ids"])
+            if name_cf == wip_col.strip().casefold():
+                wip_ids = set(col["status_ids"])
+        sprints = self._board_active_sprints(board_id)
+        sprint_name = ", ".join(s["name"] for s in sprints) if sprints else ""
+        todo = 0
+        in_progress = 0
+        todo_issues: list[dict[str, str]] = []
+        wip_issues: list[dict[str, str]] = []
+        buckets: dict[str, list[dict[str, str]]] = {c["name"]: [] for c in columns_cfg}
+        counts: dict[str, int] = {c["name"]: 0 for c in columns_cfg}
+
+        for issue in self._board_active_sprint_issues(board_id, sprints):
+            status = (issue.get("fields") or {}).get("status") or {}
+            status_id = str(status.get("id") or "")
+            brief = self._issue_brief(issue)
+            placed = False
+            for col in columns_cfg:
+                if status_id in col["status_ids"]:
+                    counts[col["name"]] += 1
+                    if len(buckets[col["name"]]) < 40:
+                        buckets[col["name"]].append(brief)
+                    placed = True
+                    break
+            if not placed:
+                continue
+            if status_id in todo_ids:
+                todo += 1
+                if len(todo_issues) < 8:
+                    todo_issues.append(brief)
+            elif status_id in wip_ids:
+                in_progress += 1
+                if len(wip_issues) < 8:
+                    wip_issues.append(brief)
+
+        columns = [
+            {
+                "name": col["name"],
+                "count": counts[col["name"]],
+                "issues": buckets[col["name"]],
+            }
+            for col in columns_cfg
+        ]
+        return {
+            "todo": todo,
+            "in_progress": in_progress,
+            "todo_label": todo_col,
+            "wip_label": wip_col,
+            "todo_issues": todo_issues,
+            "wip_issues": wip_issues,
+            "sprint_name": sprint_name,
+            "columns": columns,
+        }
+
+    def _sum_worklogs(
+        self,
+        issue_keys: list[str],
+        account_id: str,
+        week_since: datetime,
+        month_since: datetime,
+        day_since: datetime | None = None,
+    ) -> tuple[int, int, int]:
+        week_seconds = 0
+        month_seconds = 0
+        day_seconds = 0
+        week_date = week_since.date()
+        month_date = month_since.date()
+        day_date = day_since.date() if day_since else None
+        for key in issue_keys:
+            start_at = 0
+            while True:
+                r = requests.get(
+                    f"{self.base_url}/rest/api/3/issue/{key}/worklog",
+                    auth=self.auth,
+                    headers=self.headers,
+                    params={"startAt": start_at, "maxResults": 100},
+                    timeout=10,
+                )
+                r.raise_for_status()
+                data = r.json()
+                for wl in data.get("worklogs", []):
+                    author = (wl.get("author") or {}).get("accountId")
+                    if author != account_id:
+                        continue
+                    started = wl.get("started", "")
+                    try:
+                        wl_dt = datetime.strptime(started[:19], "%Y-%m-%dT%H:%M:%S")
+                        wl_date = wl_dt.date()
+                    except Exception:
+                        continue
+                    seconds = int(wl.get("timeSpentSeconds") or 0)
+                    if wl_date >= month_date:
+                        month_seconds += seconds
+                        if wl_date >= week_date:
+                            week_seconds += seconds
+                        if day_date and wl_date >= day_date:
+                            day_seconds += seconds
+                start_at += len(data.get("worklogs", []))
+                if start_at >= int(data.get("total", 0)):
+                    break
+                if not data.get("worklogs"):
+                    break
+        return week_seconds, month_seconds, day_seconds
+
+    def fetch_stats(self) -> dict[str, Any]:
+        empty_lists: dict[str, Any] = {
+            "todo_issues": [],
+            "wip_issues": [],
+            "sprint_name": "",
+            "columns": [],
+        }
+        if not self.configured():
+            return {
+                "todo": "--",
+                "in_progress": "--",
+                "week_h": "--",
+                "month_h": "--",
+                "ok": False,
+                "error": "not_configured",
+                **empty_lists,
+            }
+
+        try:
+            board_id = self.cfg.get("board_id") or ""
+            if board_id:
+                dash = self._board_dashboard(board_id)
+                todo = dash["todo"]
+                in_progress = dash["in_progress"]
+                todo_label = dash["todo_label"]
+                wip_label = dash["wip_label"]
+                todo_issues = dash["todo_issues"]
+                wip_issues = dash["wip_issues"]
+                sprint_name = dash["sprint_name"]
+                columns = list(dash.get("columns") or [])
+            else:
+                todo_status = _escape_status(self.cfg["todo_status"])
+                wip_status = _escape_status(self.cfg["inprogress_status"])
+                todo_jql = f'assignee = currentUser() AND status = "{todo_status}"'
+                wip_jql = f'assignee = currentUser() AND status = "{wip_status}"'
+                todo = self._count(todo_jql)
+                in_progress = self._count(wip_jql)
+                todo_label = self.cfg["todo_status"]
+                wip_label = self.cfg["inprogress_status"]
+                todo_issues = self._search_issue_briefs(todo_jql, 8)
+                wip_issues = self._search_issue_briefs(wip_jql, 8)
+                sprint_name = ""
+                columns = []
+
+            now = datetime.now(self.tz)
+            week_start = (now - timedelta(days=now.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            month_str = month_start.strftime("%Y-%m-%d")
+            day_str = day_start.strftime("%Y-%m-%d")
+
+            account_id = self._myself_account_id()
+            issue_keys = self._search_keys(
+                f'worklogAuthor = currentUser() AND worklogDate >= "{month_str}"'
+            )
+            day_keys = self._search_keys(
+                f'worklogAuthor = currentUser() AND worklogDate >= "{day_str}"'
+            )
+            week_seconds, month_seconds, day_seconds = self._sum_worklogs(
+                issue_keys + day_keys, account_id, week_start, month_start, day_start
+            )
+
+            columns_out = columns if board_id else []
+            return {
+                "todo": str(todo),
+                "in_progress": str(in_progress),
+                "week_h": format_hours(week_seconds),
+                "month_h": format_hours(month_seconds),
+                "day_h": format_hours(day_seconds),
+                "ok": True,
+                "error": None,
+                "todo_label": todo_label,
+                "wip_label": wip_label,
+                "board_id": board_id or None,
+                "sprint_name": sprint_name,
+                "todo_issues": todo_issues,
+                "wip_issues": wip_issues,
+                "columns": columns_out,
+            }
+        except Exception as exc:
+            return {
+                "todo": "ERR",
+                "in_progress": "ERR",
+                "week_h": "ERR",
+                "month_h": "ERR",
+                "day_h": "--",
+                "ok": False,
+                "error": str(exc),
+                **empty_lists,
+            }
