@@ -26,6 +26,7 @@
     ipValBack: $("ipValBack"),
     jiraTitleBack: $("jiraTitleBack"),
     sprintNameBack: $("sprintNameBack"),
+    jiraDayBack: $("jiraDayBack"),
     jiraWeekBack: $("jiraWeekBack"),
     jiraMonthBack: $("jiraMonthBack"),
     jiraTitle: $("jiraTitle"),
